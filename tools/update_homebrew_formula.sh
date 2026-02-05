@@ -11,15 +11,15 @@ cd "$TEMP_DIR"
 
 echo "Downloading release assets..."
 
-# Download the release assets
-curl -L -o "atlas9_darwin_amd64" \
-  "https://github.com/sio2boss/atlas9/releases/download/${VERSION}/atlas9_darwin_amd64"
-curl -L -o "atlas9_darwin_arm64" \
-  "https://github.com/sio2boss/atlas9/releases/download/${VERSION}/atlas9_darwin_arm64"
-curl -L -o "atlas9_linux_amd64" \
-  "https://github.com/sio2boss/atlas9/releases/download/${VERSION}/atlas9_linux_amd64"
-curl -L -o "atlas9_linux_arm64" \
-  "https://github.com/sio2boss/atlas9/releases/download/${VERSION}/atlas9_linux_arm64"
+# Download the release assets (tar.gz archives)
+curl -L -o "atlas9_darwin_amd64.tar.gz" \
+  "https://github.com/sio2boss/atlas9/releases/download/${VERSION}/atlas9_darwin_amd64.tar.gz"
+curl -L -o "atlas9_darwin_arm64.tar.gz" \
+  "https://github.com/sio2boss/atlas9/releases/download/${VERSION}/atlas9_darwin_arm64.tar.gz"
+curl -L -o "atlas9_linux_amd64.tar.gz" \
+  "https://github.com/sio2boss/atlas9/releases/download/${VERSION}/atlas9_linux_amd64.tar.gz"
+curl -L -o "atlas9_linux_arm64.tar.gz" \
+  "https://github.com/sio2boss/atlas9/releases/download/${VERSION}/atlas9_linux_arm64.tar.gz"
 
 echo "Generating checksums..."
 
@@ -27,10 +27,10 @@ echo "Generating checksums..."
 sha256sum * > checksums.txt
 
 # Extract checksums
-APPLE_AMD64_SHA=$(grep "darwin_amd64" checksums.txt | cut -d' ' -f1)
-APPLE_ARM64_SHA=$(grep "darwin_arm64" checksums.txt | cut -d' ' -f1)
-LINUX_AMD64_SHA=$(grep "linux_amd64" checksums.txt | cut -d' ' -f1)
-LINUX_ARM64_SHA=$(grep "linux_arm64" checksums.txt | cut -d' ' -f1)
+APPLE_AMD64_SHA=$(grep "darwin_amd64.tar.gz" checksums.txt | cut -d' ' -f1)
+APPLE_ARM64_SHA=$(grep "darwin_arm64.tar.gz" checksums.txt | cut -d' ' -f1)
+LINUX_AMD64_SHA=$(grep "linux_amd64.tar.gz" checksums.txt | cut -d' ' -f1)
+LINUX_ARM64_SHA=$(grep "linux_arm64.tar.gz" checksums.txt | cut -d' ' -f1)
 
 echo "Apple AMD64 SHA256: $APPLE_AMD64_SHA"
 echo "Apple ARM64 SHA256: $APPLE_ARM64_SHA"
@@ -52,20 +52,20 @@ class Atlas9 < Formula
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/sio2boss/atlas9/releases/download/${VERSION}/atlas9_darwin_arm64"
+      url "https://github.com/sio2boss/atlas9/releases/download/${VERSION}/atlas9_darwin_arm64.tar.gz"
       sha256 "${APPLE_ARM64_SHA}"
     else
-      url "https://github.com/sio2boss/atlas9/releases/download/${VERSION}/atlas9_darwin_amd64"
+      url "https://github.com/sio2boss/atlas9/releases/download/${VERSION}/atlas9_darwin_amd64.tar.gz"
       sha256 "${APPLE_AMD64_SHA}"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
-      url "https://github.com/sio2boss/atlas9/releases/download/${VERSION}/atlas9_linux_arm64"
+      url "https://github.com/sio2boss/atlas9/releases/download/${VERSION}/atlas9_linux_arm64.tar.gz"
       sha256 "${LINUX_ARM64_SHA}"
     else
-      url "https://github.com/sio2boss/atlas9/releases/download/${VERSION}/atlas9_linux_amd64"
+      url "https://github.com/sio2boss/atlas9/releases/download/${VERSION}/atlas9_linux_amd64.tar.gz"
       sha256 "${LINUX_AMD64_SHA}"
     end
   end
