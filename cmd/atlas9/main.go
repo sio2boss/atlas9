@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/alecthomas/chroma/v2/formatters"
+	"github.com/fsnotify/fsnotify"
 	"github.com/alecthomas/chroma/v2/lexers"
 	"github.com/alecthomas/chroma/v2/styles"
 	"github.com/docopt/docopt-go"
@@ -90,7 +92,7 @@ Usage:
 Options:
   -h, --help          Show this help.
   -v, --version       Show version.
-  -e, --env <env>     Set initial environment (local, prod). [default: local]`
+  -e, --env <env>     Override environment (default: from .env ENVIRONMENT or local)`
 
 // High ASCII block-art "atlas9" (4 lines) + tagline.
 const logoAtlas9 = `   ▐  ▜       ▞▀▖
@@ -106,6 +108,75 @@ var stageDescriptions = []string{
 	"Hash + safety checks",
 	"Preview pending SQL",
 	"Apply pending changes",
+}
+
+// parseEnvFile reads a .env file (KEY=VALUE per line) and returns a map. Returns nil map on error (e.g. file not found).
+func parseEnvFile(path string) (map[string]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	out := make(map[string]string)
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		eq := strings.Index(line, "=")
+		if eq <= 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:eq])
+		val := strings.TrimSpace(line[eq+1:])
+		if len(val) >= 2 && (val[0] == '"' && val[len(val)-1] == '"' || val[0] == '\'' && val[len(val)-1] == '\'') {
+			val = val[1 : len(val)-1]
+		}
+		out[key] = val
+	}
+	if err := s.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// loadEnv reads path as .env and updates overrides (guarded by envMu). Call from watcher or once at start of watcher goroutine.
+func loadEnv(path string, overrides map[string]string, envMu *sync.Mutex) {
+	parsed, _ := parseEnvFile(path)
+	envMu.Lock()
+	defer envMu.Unlock()
+	for k := range overrides {
+		delete(overrides, k)
+	}
+	for k, v := range parsed {
+		overrides[k] = v
+	}
+}
+
+// parseAtlasHCLEnvs reads atlas.hcl and returns the names of env blocks (e.g. ["localdev", "dev", "prod"]).
+func parseAtlasHCLEnvs(path string) []string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var names []string
+	s := string(data)
+	const prefix = `env "`
+	for {
+		i := strings.Index(s, prefix)
+		if i < 0 {
+			break
+		}
+		s = s[i+len(prefix):]
+		end := strings.Index(s, `"`)
+		if end < 0 {
+			break
+		}
+		names = append(names, s[:end])
+		s = s[end+1:]
+	}
+	return names
 }
 
 // parseDiffSummary parses SQL diff output and returns a git-like summary.
@@ -241,6 +312,10 @@ func visiblePosition(highlighted string, n int) int {
 }
 
 func main() {
+	workDir, _ := os.Getwd()
+	envPath := filepath.Join(workDir, ".env")
+	atlasHCL := filepath.Join(workDir, "atlas.hcl")
+
 	opts, err := docopt.ParseArgs(usageDoc, os.Args[1:], version)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, usageDoc)
@@ -255,20 +330,27 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Parse --env option
-	initialEnv, _ := opts.String("--env")
-	if initialEnv == "" {
-		initialEnv = "local"
+	// In-memory env overlay from .env (updated by watcher); all env reads go through getEnv so UI and atlas see .env values.
+	var envOverrides = make(map[string]string)
+	var envMu sync.Mutex
+	getEnv := func(key string) string {
+		envMu.Lock()
+		v, ok := envOverrides[key]
+		envMu.Unlock()
+		if ok {
+			return v
+		}
+		return os.Getenv(key)
 	}
-	initialEnvIndex := 0
-	switch initialEnv {
-	case "local":
-		initialEnvIndex = 0
-	case "prod":
-		initialEnvIndex = 1
-	default:
-		fmt.Fprintf(os.Stderr, "Unknown environment: %s (valid: local, prod)\n", initialEnv)
-		os.Exit(1)
+	// Current environment: --env flag overrides, then .env overlay (ENVIRONMENT), then process, then "local"
+	getCurrentEnvName := func() string {
+		if e, _ := opts.String("--env"); e != "" {
+			return e
+		}
+		if v := getEnv("ENVIRONMENT"); v != "" {
+			return v
+		}
+		return "local"
 	}
 
 	// Use terminal's native background color (don't draw any background)
@@ -289,7 +371,6 @@ func main() {
 
 	// State
 	var (
-		envIndex      = initialEnvIndex // 0 = local, 1 = prod
 		stageIndex    int
 		dockerOK      bool
 		atlasLoggedIn bool
@@ -298,13 +379,6 @@ func main() {
 		inOverlay     bool // true when config/modal/preview is showing (Esc closes it instead of quitting)
 		editMode      bool // true when editing the command line (vim-like: 'i' to enter, Esc to exit)
 	)
-	envs := []string{"local", "prod"}
-
-	// Map env name to the env var used for the database URL
-	envVarForEnv := map[string]string{
-		"local": "", // local uses hardcoded URL, no env var
-		"prod":  "DATABASE_URL_PROD",
-	}
 
 	// Logo (top left)
 	logoView := tview.NewTextView().
@@ -312,62 +386,49 @@ func main() {
 		SetTextColor(logoColor).
 		SetDynamicColors(false)
 	logoView.SetBorder(false)
-	// Top right: docker status + atlas login + env, updated when checks complete or env selection changes
+	// Top right: docker, atlas.hcl env match, env name (from .env ENVIRONMENT), APP_DB_URL (from .env or process)
 	topRightView := tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignRight)
 	topRightView.SetBorder(false)
 	updateTopRight := func() {
 		statusMu.Lock()
 		dockerStatus := dockerOK
-		atlasStatus := atlasLoggedIn
 		statusMu.Unlock()
 
-		// Docker status
+		currentEnvName := getCurrentEnvName()
+		atlasEnvs := parseAtlasHCLEnvs(atlasHCL)
+		hasAtlasEnv := false
+		for _, n := range atlasEnvs {
+			if n == currentEnvName {
+				hasAtlasEnv = true
+				break
+			}
+		}
+		appDBURLSet := getEnv("APP_DB_URL") != ""
+
 		var dockerStr string
 		if dockerStatus {
 			dockerStr = "docker  [green]✅[-]"
 		} else {
 			dockerStr = "docker  [red]❌[-]"
 		}
-
-		// Atlas login status
-		var atlasStr string
-		if atlasStatus {
-			atlasStr = "atlas login  [green]✅[-]"
+		var atlasHCLStr string
+		if hasAtlasEnv {
+			atlasHCLStr = fmt.Sprintf("atlas.hcl: %s  [green]✅[-]", currentEnvName)
 		} else {
-			atlasStr = "atlas login  [red]❌[-]"
+			atlasHCLStr = fmt.Sprintf("atlas.hcl: %s  [red]❌[-]", currentEnvName)
 		}
-
-		// Env var status for the current environment
-		envVar := envVarForEnv[envs[envIndex]]
-		envVarSet := envVar == "" || os.Getenv(envVar) != ""
-
-		// Env line with warning if env var not set
-		var envStr string
-		if envVarSet {
-			envStr = fmt.Sprintf("env: %s  [green]✅[-]", envs[envIndex])
+		envStr := fmt.Sprintf("env: %s  [green]✅[-]", currentEnvName)
+		var appDBStr string
+		if appDBURLSet {
+			appDBStr = "APP_DB_URL  [green]✅[-]"
 		} else {
-			envStr = fmt.Sprintf("env: %s  [yellow]⚠️[-]", envs[envIndex])
+			appDBStr = "APP_DB_URL  [red]❌[-]"
 		}
-
-		// Env var line (only show if this env uses an env var)
-		var envVarStr string
-		if envVar != "" {
-			if os.Getenv(envVar) != "" {
-				envVarStr = fmt.Sprintf("%s  [green]✅[-]", envVar)
-			} else {
-				envVarStr = fmt.Sprintf("%s  [red]❌[-]", envVar)
-			}
-		}
-
-		result := dockerStr + "\n" + atlasStr + "\n" + envStr
-		if envVarStr != "" {
-			result += "\n" + envVarStr
-		}
-		topRightView.SetText(result)
+		topRightView.SetText(dockerStr + "\n" + atlasHCLStr + "\n" + envStr + "\n" + appDBStr)
 	}
 	updateTopRight()
 
-	// Top row: logo left, docker+env right (wide enough for DATABASE_URL_PROD on one line)
+	// Top row: logo left, docker+env right (wide enough for APP_DB_URL on one line)
 	topFlex := tview.NewFlex().SetDirection(tview.FlexColumn).
 		AddItem(logoView, 0, 1, false).
 		AddItem(topRightView, 28, 0, false)
@@ -454,7 +515,7 @@ func main() {
 			desc += "  [yellow](not logged in — may fail; run 'atlas login')[-]"
 		}
 		descriptionView.SetText("[#98E0EA::b]" + desc + "[-]")
-		commandInput.SetText(projectedCommand(stageIndex, envs[envIndex]))
+		commandInput.SetText(projectedCommand(stageIndex, getCurrentEnvName()))
 	}
 
 	bodyFlex := tview.NewFlex().SetDirection(tview.FlexRow).
@@ -538,13 +599,74 @@ func main() {
 	}
 	go checkAtlasLogin()
 
-	// Working directory: current directory
-	workDir, _ := os.Getwd()
-	atlasHCL := filepath.Join(workDir, "atlas.hcl")
+	// .env watcher: keep env overlay in sync and refresh UI when .env changes
+	go func() {
+		loadEnv(envPath, envOverrides, &envMu)
+		app.QueueUpdateDraw(func() {
+			updateTopRight()
+			updateDescriptionAndCommand()
+			highlightStageOnly(stageIndex)
+		})
+		watcher, err := fsnotify.NewWatcher()
+		if err != nil {
+			return
+		}
+		defer watcher.Close()
+		if err := watcher.Add(workDir); err != nil {
+			return
+		}
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if (event.Op&(fsnotify.Write|fsnotify.Create) != 0) && filepath.Base(event.Name) == ".env" {
+					loadEnv(envPath, envOverrides, &envMu)
+					app.QueueUpdateDraw(func() {
+						updateTopRight()
+						updateDescriptionAndCommand()
+						highlightStageOnly(stageIndex)
+					})
+				}
+			case _, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+			}
+		}
+	}()
 
+	// envForAtlas returns os.Environ() with .env overlay (so atlas subprocess sees ENVIRONMENT/APP_DB_URL from .env).
+	envForAtlas := func() []string {
+		envMu.Lock()
+		overrides := make(map[string]string, len(envOverrides))
+		for k, v := range envOverrides {
+			overrides[k] = v
+		}
+		envMu.Unlock()
+		base := make([]string, len(os.Environ()))
+		copy(base, os.Environ())
+		for k, v := range overrides {
+			kv := k + "=" + v
+			found := false
+			for i, e := range base {
+				if strings.HasPrefix(e, k+"=") {
+					base[i] = kv
+					found = true
+					break
+				}
+			}
+			if !found {
+				base = append(base, kv)
+			}
+		}
+		return base
+	}
 	runAtlas := func(args ...string) (stdout, stderr string, err error) {
 		cmd := exec.Command("atlas", args...)
 		cmd.Dir = workDir
+		cmd.Env = envForAtlas()
 		cmd.Stdin = nil // don't attach terminal stdin; child gets EOF so it never blocks on read
 		var out, errOut strings.Builder
 		cmd.Stdout = &out
@@ -604,7 +726,7 @@ func main() {
 			return
 		}
 		running = true
-		env := envs[envIndex]
+		env := getCurrentEnvName()
 		go func() {
 			defer func() { running = false }()
 			switch stageIndex {
@@ -815,7 +937,7 @@ func main() {
 							go runStage()
 						}
 					})
-				if envs[envIndex] == "prod" {
+				if getCurrentEnvName() == "prod" {
 					modal.SetBorderColor(tcell.ColorRed)
 				}
 				modal.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
@@ -885,33 +1007,19 @@ func main() {
 				updateUI()
 				return nil
 			case 'e', 'E':
-				// Environment selector modal (floating over window, same style as Apply)
+				// Show current environment (from .env ENVIRONMENT)
 				closeEnvModal := func() {
 					applyOverlay = nil
 					inOverlay = false
 					app.SetFocus(stageRowView)
 					updateUI()
 				}
+				currentEnv := getCurrentEnvName()
 				modal := tview.NewModal().
-					SetText("Select environment:\n\n[Local]  [Prod]").
-					AddButtons([]string{"local", "prod", "Cancel"}).
+					SetText(fmt.Sprintf("Current environment: %s\n\n(from .env ENVIRONMENT)\nEdit .env to change.", currentEnv)).
+					AddButtons([]string{"OK"}).
 					SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-						applyOverlay = nil
-						inOverlay = false
-						switch buttonLabel {
-						case "local":
-							envIndex = 0
-							updateTopRight()
-							updateDescriptionAndCommand()
-							go checkDocker()
-						case "prod":
-							envIndex = 1
-							updateTopRight()
-							updateDescriptionAndCommand()
-							go checkDocker()
-						}
-						app.SetFocus(stageRowView)
-						updateUI()
+						closeEnvModal()
 					})
 				modal.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 					switch event.Key() {
@@ -998,7 +1106,7 @@ func main() {
   ↓/↑              — scroll output
   Enter            — run current stage command
   i                — edit command (vim-like: Esc to exit edit mode)
-  e                — select environment (local / prod)
+  e                — show current environment (from .env)
   c                — edit atlas.hcl config file
   h                — this help
   q                — quit
@@ -1051,6 +1159,14 @@ Apply asks for confirmation (Apply or Cancel) before running.`
 
 	app.SetRoot(rootWithOverlay, true).SetFocus(outputView)
 	updateUI()
+	// Run status automatically on start (must queue from a goroutine so main can enter Run() first; QueueUpdate blocks until the event loop runs the callback)
+	go func() {
+		app.QueueUpdate(func() {
+			outputView.SetText("Running...")
+			outputView.ScrollToBeginning()
+			go runStage()
+		})
+	}()
 	if err := app.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
