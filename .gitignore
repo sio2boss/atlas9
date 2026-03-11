@@ -14,3 +14,4 @@ src
 release
 /atlas9
 /homebrew
+.env

@@ -730,7 +730,15 @@ func main() {
 		go func() {
 			defer func() { running = false }()
 			switch stageIndex {
-			case 0: // Status - show applied vs pending
+			case 0: // Status - run hash first, then show applied vs pending
+				hashOut, hashErrOut, hashErr := runAtlas("migrate", "hash", "--env", env)
+				if hashErr != nil {
+					app.QueueUpdate(func() {
+						outputView.SetText(fmt.Sprintf("Hash failed: %v\n\nStderr:\n%s\nStdout:\n%s", hashErr, hashErrOut, hashOut))
+						outputView.ScrollToBeginning()
+					})
+					return
+				}
 				out, errOut, err := runAtlas("migrate", "status", "--env", env)
 				app.QueueUpdate(func() {
 					if err != nil {
